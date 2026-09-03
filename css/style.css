@@ -236,6 +236,8 @@ ul{list-style:none;}
 .footer-inner{display:flex;flex-direction:column;align-items:center;gap:10px;}
 .footer-logo{display:flex;align-items:center;gap:8px;font-weight:900;color:#fff;font-size:16px;}
 .footer-company{font-size:13px;}
+.footer-link{text-decoration:underline;text-underline-offset:2px;}
+.footer-link:hover{color:#fff;}
 .footer-copy{font-size:12px;opacity:.7;}
 
 /* Floating LINE button */
