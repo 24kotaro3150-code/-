@@ -31,6 +31,7 @@
     <nav class="site-nav" id="siteNav">
       <a href="#service">サービス内容</a>
       <a href="#flow">口コミの流れ</a>
+      <a href="#voice">お客様の声</a>
       <a href="#price">料金プラン</a>
       <a href="#faq">よくある質問</a>
     </nav>
@@ -216,6 +217,33 @@
     </div>
   </section>
 
+  <!-- ===== Customer Voice (Google Reviews) ===== -->
+  <section class="section voice" id="voice">
+    <div class="container">
+      <p class="section-eyebrow">VOICE</p>
+      <h2 class="section-title">お客様の声</h2>
+      <p class="section-lead">Googleマップに投稿された、実際のお客様の口コミをご紹介します。</p>
+
+      <div class="voice-summary" id="voiceSummary"></div>
+
+      <div class="voice-scroll" id="voiceScroll">
+        <p class="voice-loading" id="voiceLoading">口コミを読み込み中…</p>
+      </div>
+
+      <div class="voice-cta">
+        <a href="https://maps.app.goo.gl/ufeDuCxyq5E3i1cTA" target="_blank" rel="noopener" class="btn btn-outline">
+          <svg class="google-g" width="18" height="18" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+            <path fill="#4285F4" d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v9h11.8c-.5 2.7-2.1 5-4.4 6.6v5.4h7.1c4.2-3.9 6.6-9.6 6.6-16.5z"/>
+            <path fill="#34A853" d="M24 46c5.9 0 10.9-2 14.5-5.3l-7.1-5.4c-2 1.3-4.5 2.1-7.4 2.1-5.7 0-10.5-3.8-12.2-9H4.5v5.6C8.1 41.1 15.4 46 24 46z"/>
+            <path fill="#FBBC05" d="M11.8 28.4c-.4-1.3-.7-2.7-.7-4.4s.3-3.1.7-4.4v-5.6H4.5C3 16.9 2 20.3 2 24s1 7.1 2.5 10l7.3-5.6z"/>
+            <path fill="#EA4335" d="M24 10.7c3.2 0 6 1.1 8.3 3.3l6.2-6.2C34.9 4.3 29.9 2 24 2 15.4 2 8.1 6.9 4.5 14l7.3 5.6c1.7-5.2 6.5-8.9 12.2-8.9z"/>
+          </svg>
+          Googleの口コミをすべて見る
+        </a>
+      </div>
+    </div>
+  </section>
+
   <!-- ===== Exclusivity ===== -->
   <section class="section exclusive">
     <div class="container">
@@ -304,6 +332,10 @@
           <button class="faq-q">近隣の同業者と重複して契約されることはありますか？<span class="faq-toggle">＋</span></button>
           <div class="faq-a"><p>「1地域（市区町村）＋1キーワード」につき1社限定の制度を採用しており、同一エリア・同一キーワードでの競合対策は行いません。</p></div>
         </div>
+        <div class="faq-item">
+          <button class="faq-q">決済方法は振り込みのみですか？<span class="faq-toggle">＋</span></button>
+          <div class="faq-a"><p>クレジットカード・振込からお選びいただけます。</p></div>
+        </div>
       </div>
     </div>
   </section>
@@ -348,5 +380,8 @@
 </a>
 
 <script src="js/main.js"></script>
+<script src="js/reviews.js"></script>
+<!-- YOUR_GOOGLE_MAPS_API_KEY をPlaces API有効化済みのAPIキーに差し替えてください -->
+<script src="https://maps.googleapis.com/maps/api/js?key=YOUR_GOOGLE_MAPS_API_KEY&libraries=places&callback=initGoogleReviews" async defer></script>
 </body>
 </html>
