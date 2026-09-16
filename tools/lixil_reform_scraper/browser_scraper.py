@@ -80,22 +80,36 @@ def launch_browser(p, headless: bool):
 
 _FIND_CARD_BOUNDARY_JS = """
 (el, contactText) => {
+    // ボタンが <button>/<a>/role=button とは限らない(例: 単なる<div class="m-btn">)
+    // ため、タグ/role種別は問わず「この文言を含み、かつ子要素の誰もこの文言を
+    // 含まない(=文言を含む最も内側の要素)」ものを1個の"ボタン相当"としてカウントする。
+    function isTightMatch(node) {
+        if (!(node.textContent || '').includes(contactText)) return false;
+        for (const child of node.children) {
+            if ((child.textContent || '').includes(contactText)) return false;
+        }
+        return true;
+    }
     function matchCount(root) {
-        const candidates = root.querySelectorAll('button, a, [role="button"], [role="link"]');
         let count = 0;
-        for (const node of candidates) {
-            if ((node.textContent || '').includes(contactText)) count += 1;
+        for (const node of root.querySelectorAll('*')) {
+            if (isTightMatch(node)) count += 1;
         }
         return count;
     }
     let cur = el;
-    for (let i = 0; i < 12 && cur.parentElement; i++) {
+    let lastGood = null;
+    for (let i = 0; i < 20 && cur.parentElement; i++) {
         cur = cur.parentElement;
-        if (matchCount(cur) === 1) {
-            return cur;
+        const count = matchCount(cur);
+        if (count === 1) {
+            lastGood = cur;
+        } else if (count > 1) {
+            // 兄弟カード(他店舗)のボタンまで含んでしまう手前で止める。
+            break;
         }
     }
-    return null;
+    return lastGood;
 }
 """
 
@@ -103,9 +117,9 @@ _FIND_CARD_BOUNDARY_JS = """
 def find_card(button: Locator, contact_button_text: str) -> ElementHandle | None:
     """「問い合わせする」ボタンから店舗カードの境界要素を特定する。
 
-    「詳細を見る」等の固定文言や見出しタグに依存せず、対象ボタンを起点に
-    祖先を辿って「問い合わせするボタンをちょうど1個だけ含む最小の祖先要素」
-    をカードとみなす、汎用的な一覧アイテム境界検出。
+    タグ名やclass名、見出しの有無に依存せず、対象ボタンを起点に祖先を
+    辿って「他の店舗のボタンを巻き込む直前の、最も外側の祖先要素」を
+    カード(1店舗分のブロック)とみなす、汎用的な一覧アイテム境界検出。
     """
     handle = button.element_handle()
     if handle is None:
