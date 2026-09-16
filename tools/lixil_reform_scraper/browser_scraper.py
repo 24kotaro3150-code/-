@@ -467,7 +467,7 @@ def extract_total_items(page: Page) -> int | None:
     """「368件中 1〜10件を表示」のような表記から総件数を読み取る。"""
     try:
         text = page.locator("body").inner_text()
-    except PlaywrightTimeoutError:
+    except Exception:
         return None
     m = TOTAL_COUNT_RE.search(text)
     return int(m.group(1)) if m else None
@@ -482,10 +482,15 @@ def go_to_page(page: Page, target_page: int, next_page_text: str, delay: float) 
     2. ページ番号がウィンドウ外で見当たらない場合は、「次へ」相当の矢印/ボタンを
        候補セレクタから順に試してクリックする。
     """
+    # このサイトはページ送りが(SPAではなく)実際のページ遷移(?P=2等)で行われる。
+    # そのため遷移中は document/実行コンテキストが一瞬失われるタイミングがあり、
+    # 通常のPlaywrightTimeoutErrorとは別種の例外(実行コンテキスト破棄など)が
+    # 起こり得る。1ページの遷移タイミングのズレで都道府県全体の処理を失う
+    # ことがないよう、ここでは広めにExceptionを捕まえて処理を続行する。
     before_text = ""
     try:
         before_text = page.locator("body").inner_text()[:2000]
-    except PlaywrightTimeoutError:
+    except Exception:
         pass
 
     clicked = False
@@ -501,7 +506,7 @@ def go_to_page(page: Page, target_page: int, next_page_text: str, delay: float) 
                 loc.click(timeout=3000)
                 clicked = True
                 break
-        except PlaywrightTimeoutError:
+        except Exception:
             continue
 
     if not clicked:
@@ -512,23 +517,28 @@ def go_to_page(page: Page, target_page: int, next_page_text: str, delay: float) 
                     loc.click(timeout=3000)
                     clicked = True
                     break
-            except PlaywrightTimeoutError:
+            except Exception:
                 continue
 
     if not clicked:
         return False
 
-    page.wait_for_load_state("networkidle")
+    try:
+        page.wait_for_load_state("networkidle")
+    except Exception:
+        pass
+
     if before_text:
         try:
             page.wait_for_function(
-                "(prev) => document.body.innerText.slice(0, 2000) !== prev",
+                "(prev) => !!document.body && document.body.innerText.slice(0, 2000) !== prev",
                 arg=before_text,
                 timeout=8000,
             )
-        except PlaywrightTimeoutError:
-            # SPA遷移でない、または比較範囲がたまたま変化しない場合もあるので、
-            # ここでは失敗として扱わず、下の待機時間に委ねる。
+        except Exception:
+            # SPA遷移でない、比較範囲がたまたま変化しない、遷移タイミングで
+            # 実行コンテキストが一時的に失われた等、いずれの場合も失敗とは
+            # 扱わず、下の待機時間に委ねる。
             pass
     time.sleep(delay)
     return True
@@ -545,6 +555,16 @@ def save_csv(records: list[ShopRecord], output_path: str) -> None:
 def scrape_list_pages(page: Page, start_url: str, args: argparse.Namespace) -> list[ShopRecord]:
     """1つの一覧ページ(都道府県で絞り込み済み等)を、ページ送りしながら最後まで巡回する。"""
     page.goto(start_url, wait_until="networkidle")
+    if page.url.rstrip("/") != start_url.rstrip("/"):
+        # 直前の都道府県での遷移トラブルの余波で別ページに流れた、あるいは
+        # サイト側の何らかのリダイレクトで想定外のページに着地した可能性がある。
+        # 0件になった場合に「本当に該当店舗が無い」のか「取得に失敗した」のか
+        # 見分けられるよう、ここで明示的に警告しておく。
+        print(
+            f"[warn] 遷移先が指定URLと異なります(指定: {start_url} / 実際: {page.url})。"
+            "想定外のページに遷移した可能性があります。",
+            file=sys.stderr,
+        )
 
     all_records: list[ShopRecord] = []
     page_count = 0
@@ -651,7 +671,7 @@ def merge_csvs(output_dir: str, merged_path: str) -> int:
     return len(all_rows)
 
 
-def run_all_prefectures(page: Page, args: argparse.Namespace) -> None:
+def run_all_prefectures(browser, args: argparse.Namespace) -> None:
     """start_url を都道府県トップページとして扱い、全都道府県を順番に取得する。
 
     都道府県ごとに output_dir/<都道府県名>.csv として個別保存するため、
@@ -661,10 +681,20 @@ def run_all_prefectures(page: Page, args: argparse.Namespace) -> None:
     - 1都道府県の取得中にエラーが起きても、その都道府県だけスキップして
       残りの都道府県は継続する
     という形で長時間の全国走行に対応する。
+
+    都道府県ごとに新しいブラウザページ(Page)を作り直して処理する。1つの
+    都道府県でページ遷移がらみのエラーが起きた場合でも、そのブラウザ
+    タブの状態(中途半端に開いたポップアップや遷移途中のDOM等)を次の
+    都道府県に持ち越さないようにするため。
     """
     os.makedirs(args.output_dir, exist_ok=True)
 
-    prefectures = discover_prefecture_links(page, args.start_url)
+    discovery_page = browser.new_page()
+    try:
+        prefectures = discover_prefecture_links(discovery_page, args.start_url)
+    finally:
+        discovery_page.close()
+
     print(f"[info] {len(prefectures)}/{len(PREFECTURES)} 都道府県のリンクを検出しました", file=sys.stderr)
     if len(prefectures) < len(PREFECTURES):
         missing = [name for name in PREFECTURES if name not in {n for n, _ in prefectures}]
@@ -684,6 +714,7 @@ def run_all_prefectures(page: Page, args: argparse.Namespace) -> None:
             continue
 
         print(f"[info] ({i}/{len(prefectures)}) {name} の取得を開始します: {url}", file=sys.stderr)
+        page = browser.new_page()
         try:
             records = scrape_list_pages(page, url, args)
             save_csv(records, pref_csv)
@@ -691,6 +722,8 @@ def run_all_prefectures(page: Page, args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001 - 1都道府県の失敗で全体を止めないための意図的な広い捕捉
             print(f"[error] {name} の取得中にエラーが発生しました: {exc}", file=sys.stderr)
             print(f"[error] {name} をスキップして次の都道府県に進みます", file=sys.stderr)
+        finally:
+            page.close()
 
         total = merge_csvs(args.output_dir, args.output)
         print(f"[info] ここまでの全国合計を {args.output} に反映しました(現在 {total} 件)", file=sys.stderr)
@@ -769,13 +802,13 @@ def main() -> None:
 
     with sync_playwright() as p:
         browser = launch_browser(p, headless=not args.headed)
-        page = browser.new_page()
 
         if args.all_prefectures:
-            run_all_prefectures(page, args)
+            run_all_prefectures(browser, args)
             browser.close()
             return
 
+        page = browser.new_page()
         records = scrape_list_pages(page, args.start_url, args)
         browser.close()
 
