@@ -237,14 +237,14 @@ def debug_dump_dom(button: Locator, card: ElementHandle | None) -> None:
 # 実サイトのDOM確認で判明した、ポップアップ本体のクラス名パターン。
 # トリガー側は "tooltip-contact-trigger"、ポップアップ本体は "tooltip-contact ..." で
 # "trigger" を含まないため、両者をこの条件で区別できる。
-_OPEN_TOOLTIP_TEXT_JS = """
+_OPEN_TOOLTIP_ELEMENT_JS = """
 () => {
     const candidates = Array.from(document.querySelectorAll('[class*="tooltip-contact"]'))
         .filter(el => !el.className.includes('trigger'));
     for (const el of candidates) {
         const style = window.getComputedStyle(el);
         if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) {
-            return el.innerText;
+            return el;
         }
     }
     return null;
@@ -263,25 +263,65 @@ _ANY_TOOLTIP_OPEN_JS = """
 """
 
 
+def _extract_number_near_label(text: str, labels: list[str]) -> str:
+    for label in labels:
+        m = re.search(rf"{re.escape(label)}[^0-9]{{0,10}}({PHONE_RE.pattern})", text)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def open_popup_and_read(page: Page, button: Locator, popup_wait_ms: int) -> tuple[str, str]:
-    """「問い合わせする」ボタンをクリックし、開いたポップアップからTEL/FAXを読む。"""
+    """「問い合わせする」ボタンをクリックし、開いたポップアップからTEL/FAXを読む。
+
+    実サイトのポップアップは、フリーダイヤル(0120等)が別途表示される店舗もある
+    ("TEL"欄とFAXの間にもう1つ電話番号らしき行が挟まる)。そのため単純に
+    「最初の番号=TEL、2番目の番号=FAX」と位置で決め打ちすると、フリーダイヤルを
+    FAXと誤認識してしまう。実DOMで確認済みの、TEL行が持つ "tell" クラス、FAX行が
+    持つ "fax" クラスを使って直接該当要素から読み取ることで、間に何個フリー
+    ダイヤルが挟まっていても正しくTEL/FAXを区別する。
+    """
     button.click()
     try:
         page.wait_for_timeout(popup_wait_ms)
-        # まず、実際に開いている(表示中の)ポップアップ本体の中だけを見る。
-        # 前のカードのポップアップが閉じ切れずに残っていた場合の誤読を防ぐため、
-        # ページ全体のテキストは最後の保険としてのみ使う。
-        scoped_text = page.evaluate(_OPEN_TOOLTIP_TEXT_JS)
+        tooltip = page.evaluate_handle(_OPEN_TOOLTIP_ELEMENT_JS).as_element()
     except PlaywrightTimeoutError:
         return "", ""
 
-    source_text = scoped_text
-    if not source_text:
-        source_text = page.locator("body").inner_text()
+    phone = ""
+    fax = ""
 
+    if tooltip is not None:
+        tel_el = tooltip.query_selector('[class*="tell"], [class*="tel__"], [class*="tel-"]')
+        fax_el = tooltip.query_selector('[class*="fax"]')
+        if tel_el:
+            m = PHONE_RE.search(tel_el.inner_text())
+            phone = m.group(0) if m else ""
+        if fax_el:
+            m = PHONE_RE.search(fax_el.inner_text())
+            fax = m.group(0) if m else ""
+
+    if phone and fax:
+        return phone, fax
+
+    # クラス名でTEL/FAXの要素を特定できなかった場合のフォールバック。
+    # 位置(何番目の番号か)ではなく、"TEL"/"FAX"ラベル直後の番号を拾う方式にして、
+    # 間にフリーダイヤル等が挟まっていても誤認識しにくくする。
+    source_text = tooltip.inner_text() if tooltip is not None else page.locator("body").inner_text()
+    if not phone:
+        phone = _extract_number_near_label(source_text, ["TEL", "Tel", "電話"])
+    if not fax:
+        fax = _extract_number_near_label(source_text, ["FAX", "Fax"])
+
+    if phone and fax:
+        return phone, fax
+
+    # それでも取れない場合の最終フォールバック(従来通り、最初の2件を使う)。
     phones = PHONE_RE.findall(source_text)
-    phone = phones[0] if len(phones) >= 1 else ""
-    fax = phones[1] if len(phones) >= 2 else ""
+    if not phone:
+        phone = phones[0] if len(phones) >= 1 else ""
+    if not fax:
+        fax = next((p for p in phones if p != phone), "")
     return phone, fax
 
 
