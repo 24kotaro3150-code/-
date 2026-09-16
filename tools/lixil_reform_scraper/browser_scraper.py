@@ -269,6 +269,7 @@ def scrape_page(
     delay_between_cards: float,
     popup_wait_ms: int,
     debug_first_card: bool,
+    max_items: int = 0,
 ) -> list[ShopRecord]:
     records: list[ShopRecord] = []
     buttons = page.get_by_role("button", name=contact_button_text).all()
@@ -280,6 +281,8 @@ def scrape_page(
     # あるため、実際に見えているものだけを対象にする。非表示要素をクリックしようと
     # するとPlaywrightが操作可能になるまで待ち続け、スクリプトがハングするため。
     buttons = [b for b in buttons if b.is_visible()]
+    if max_items:
+        buttons = buttons[:max_items]
 
     for i, button in enumerate(buttons):
         card = find_card(button, contact_button_text)
@@ -424,6 +427,12 @@ def main() -> None:
         help="ページ番号リンクが見つからない場合に使う「次へ」相当リンク/ボタンの文言",
     )
     parser.add_argument("--max-pages", type=int, default=0, help="巡回する一覧ページ数の上限。0で無制限")
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=0,
+        help="取得する店舗件数の上限。0で無制限(達した時点でページの途中でも打ち切る。動作確認用)",
+    )
     parser.add_argument("--delay-between-cards", type=float, default=0.8, help="カードごとの待機時間(秒)")
     parser.add_argument("--delay-between-pages", type=float, default=1.5, help="ページ送り後の待機時間(秒)")
     parser.add_argument("--popup-wait-ms", type=int, default=500, help="ポップアップ表示待ちのミリ秒")
@@ -447,6 +456,7 @@ def main() -> None:
         while True:
             page_count += 1
             print(f"[info] ページ {page_count} を処理中: {page.url}", file=sys.stderr)
+            remaining = args.max_items - len(all_records) if args.max_items else 0
             records = scrape_page(
                 page,
                 args.contact_button_text,
@@ -454,9 +464,14 @@ def main() -> None:
                 args.delay_between_cards,
                 args.popup_wait_ms,
                 args.debug_first_card,
+                max_items=remaining,
             )
             all_records.extend(records)
             print(f"[info] このページで {len(records)} 件取得(累計 {len(all_records)} 件)", file=sys.stderr)
+
+            if args.max_items and len(all_records) >= args.max_items:
+                print(f"[info] --max-items の上限({args.max_items})に到達したため終了します", file=sys.stderr)
+                break
 
             if page_count == 1 and records:
                 total_items = extract_total_items(page)
