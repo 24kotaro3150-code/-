@@ -44,7 +44,13 @@ import sys
 import time
 from dataclasses import dataclass
 
-from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import (
+    ElementHandle,
+    Locator,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 # 環境変数 PLAYWRIGHT_BROWSERS_PATH が正しく設定されていれば executable_path は
 # 省略できる。このサンドボックスのように既定パスとPlaywrightのバージョンが
@@ -72,29 +78,119 @@ def launch_browser(p, headless: bool):
     return p.chromium.launch(**kwargs)
 
 
-def find_card(button: Locator) -> Locator:
-    """「問い合わせする」ボタンから、店舗カード(会社名・住所を含む祖先要素)を辿る。"""
-    return button.locator(
-        "xpath=ancestor::*[.//*[self::button or self::a]"
-        "[contains(normalize-space(.), '詳細を見る')]][1]"
-    )
+_FIND_CARD_BOUNDARY_JS = """
+(el, contactText) => {
+    function matchCount(root) {
+        const candidates = root.querySelectorAll('button, a, [role="button"], [role="link"]');
+        let count = 0;
+        for (const node of candidates) {
+            if ((node.textContent || '').includes(contactText)) count += 1;
+        }
+        return count;
+    }
+    let cur = el;
+    for (let i = 0; i < 12 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        if (matchCount(cur) === 1) {
+            return cur;
+        }
+    }
+    return null;
+}
+"""
 
 
-def extract_card_info(card: Locator) -> tuple[str, str]:
-    """カード内から会社名(見出し)と住所を取り出す。"""
+def find_card(button: Locator, contact_button_text: str) -> ElementHandle | None:
+    """「問い合わせする」ボタンから店舗カードの境界要素を特定する。
+
+    「詳細を見る」等の固定文言や見出しタグに依存せず、対象ボタンを起点に
+    祖先を辿って「問い合わせするボタンをちょうど1個だけ含む最小の祖先要素」
+    をカードとみなす、汎用的な一覧アイテム境界検出。
+    """
+    handle = button.element_handle()
+    if handle is None:
+        return None
+    result = handle.evaluate_handle(_FIND_CARD_BOUNDARY_JS, contact_button_text)
+    return result.as_element()
+
+
+def extract_card_info(card: ElementHandle) -> tuple[str, str]:
+    """カード内から会社名(見出し、無ければ先頭行)と住所を取り出す。"""
     company = ""
-    for tag in ("h1", "h2", "h3", "h4"):
-        heading = card.locator(tag).first
-        if heading.count() > 0:
+    for tag in ("h1", "h2", "h3", "h4", "h5"):
+        heading = card.query_selector(tag)
+        if heading:
             company = heading.inner_text().strip()
             break
 
-    address = ""
     text = card.inner_text()
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+    if not company and lines:
+        company = lines[0]
+
+    address = ""
     m = re.search(r"住所[^\S\n]*[:：]?\s*\n?([^\n]+)", text)
     if m:
         address = m.group(1).strip()
     return company, address
+
+
+def debug_dump_dom(button: Locator, card: ElementHandle | None) -> None:
+    """会社名・住所が取れない原因を調べるため、実際のDOM構造を出力する。"""
+    print("---- DOM debug ----", file=sys.stderr)
+    try:
+        btn_html = button.evaluate("el => el.outerHTML")
+    except Exception as exc:
+        btn_html = f"(取得失敗: {exc})"
+    print(f"[問い合わせするボタン outerHTML]\n{btn_html[:800]}\n", file=sys.stderr)
+
+    if card is not None:
+        try:
+            card_html = card.evaluate("el => el.outerHTML")
+        except Exception as exc:
+            card_html = f"(取得失敗: {exc})"
+        print(f"[find_card()が特定したカード outerHTML (先頭3000文字)]\n{card_html[:3000]}\n", file=sys.stderr)
+    else:
+        print(
+            "[find_card() は該当要素を見つけられませんでした"
+            "(「問い合わせする」ボタンを1個だけ含む祖先要素が12階層以内に無かった)。"
+            "ボタンの祖先要素チェーンを表示します]",
+            file=sys.stderr,
+        )
+        try:
+            chain = button.evaluate(
+                """
+                el => {
+                    let chain = [];
+                    let cur = el.parentElement;
+                    for (let i = 0; i < 12 && cur; i++) {
+                        const cls = cur.className ? '.' + String(cur.className).replace(/\\s+/g, '.') : '';
+                        chain.push(cur.tagName.toLowerCase() + cls);
+                        cur = cur.parentElement;
+                    }
+                    return chain.join(' > ');
+                }
+                """
+            )
+        except Exception as exc:
+            chain = f"(取得失敗: {exc})"
+        print(f"祖先要素チェーン(近い順): {chain}\n", file=sys.stderr)
+
+        try:
+            grandparent_html = button.evaluate(
+                "el => el.parentElement && el.parentElement.parentElement "
+                "? el.parentElement.parentElement.outerHTML : ''"
+            )
+        except Exception as exc:
+            grandparent_html = f"(取得失敗: {exc})"
+        print(f"[祖父要素 outerHTML (先頭2000文字)]\n{grandparent_html[:2000]}\n", file=sys.stderr)
+
+    print(
+        "この出力をそのまま貼り付けてもらえれば、find_card()/extract_card_info() を"
+        "実際の構造に合わせて修正します。",
+        file=sys.stderr,
+    )
 
 
 def open_popup_and_read(page: Page, button: Locator, popup_wait_ms: int) -> tuple[str, str]:
@@ -140,8 +236,11 @@ def scrape_page(
         buttons = page.locator(f"text={contact_button_text}").all()
 
     for i, button in enumerate(buttons):
-        card = find_card(button)
-        company, address = extract_card_info(card if card.count() > 0 else button)
+        card = find_card(button, contact_button_text)
+        if card is not None:
+            company, address = extract_card_info(card)
+        else:
+            company, address = "", ""
         phone, fax = open_popup_and_read(page, button, popup_wait_ms)
         close_popup(page, close_selector)
 
@@ -159,6 +258,8 @@ def scrape_page(
                 "PHONE_RE を実際のDOMに合わせて調整してください。",
                 file=sys.stderr,
             )
+            if not record.company or not record.address:
+                debug_dump_dom(button, card)
             return records
 
         time.sleep(delay_between_cards)
