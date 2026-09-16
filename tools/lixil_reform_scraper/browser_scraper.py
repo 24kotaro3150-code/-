@@ -39,11 +39,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import math
+import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from urllib.parse import urljoin
 
 from playwright.sync_api import (
     ElementHandle,
@@ -60,6 +63,19 @@ FALLBACK_CHROMIUM_PATH = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
 
 PHONE_RE = re.compile(r"0\d{1,4}[-‐]\d{1,4}[-‐]\d{3,4}")
 
+# 都道府県トップページ(https://www.lixil-reform.net/shop_search 等)から
+# 各都道府県の一覧ページへ飛ぶために使う、標準の47都道府県名。
+PREFECTURES = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県",
+    "岐阜県", "静岡県", "愛知県", "三重県",
+    "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県",
+    "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県",
+    "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+]
+
 
 @dataclass
 class ShopRecord:
@@ -71,8 +87,6 @@ class ShopRecord:
 
 
 def launch_browser(p, headless: bool):
-    import os
-
     kwargs = {"headless": headless}
     if os.path.exists(FALLBACK_CHROMIUM_PATH):
         kwargs["executable_path"] = FALLBACK_CHROMIUM_PATH
@@ -528,9 +542,168 @@ def save_csv(records: list[ShopRecord], output_path: str) -> None:
             writer.writerow([r.company, r.address, r.phone, r.fax, r.url])
 
 
+def scrape_list_pages(page: Page, start_url: str, args: argparse.Namespace) -> list[ShopRecord]:
+    """1つの一覧ページ(都道府県で絞り込み済み等)を、ページ送りしながら最後まで巡回する。"""
+    page.goto(start_url, wait_until="networkidle")
+
+    all_records: list[ShopRecord] = []
+    page_count = 0
+    total_pages: int | None = None
+    while True:
+        page_count += 1
+        print(f"[info] ページ {page_count} を処理中: {page.url}", file=sys.stderr)
+        remaining = args.max_items - len(all_records) if args.max_items else 0
+        records = scrape_page(
+            page,
+            args.contact_button_text,
+            args.close_selector,
+            args.delay_between_cards,
+            args.popup_wait_ms,
+            args.debug_first_card,
+            max_items=remaining,
+        )
+        all_records.extend(records)
+        print(f"[info] このページで {len(records)} 件取得(累計 {len(all_records)} 件)", file=sys.stderr)
+
+        if args.max_items and len(all_records) >= args.max_items:
+            print(f"[info] --max-items の上限({args.max_items})に到達したため終了します", file=sys.stderr)
+            break
+
+        if page_count == 1 and records:
+            total_items = extract_total_items(page)
+            page_size = len(records)
+            if total_items:
+                total_pages = math.ceil(total_items / page_size)
+                print(
+                    f"[info] 総件数 {total_items} 件 / 1ページ {page_size} 件 "
+                    f"→ 全 {total_pages} ページと推定",
+                    file=sys.stderr,
+                )
+
+        if args.debug_first_card:
+            break
+        if args.max_pages and page_count >= args.max_pages:
+            print(f"[info] --max-pages の上限({args.max_pages})に到達したため終了します", file=sys.stderr)
+            break
+        if total_pages and page_count >= total_pages:
+            print("[info] 推定ページ数に到達したため終了します", file=sys.stderr)
+            break
+        if not go_to_page(page, page_count + 1, args.next_page_text, args.delay_between_pages):
+            print("[info] 次ページへのリンクが見つからなかったため終了します", file=sys.stderr)
+            break
+
+    return all_records
+
+
+def discover_prefecture_links(page: Page, search_url: str) -> list[tuple[str, str]]:
+    """都道府県トップページ(shop_search等)から、各都道府県一覧ページへのURLを集める。
+
+    「北海道」「青森県」...という確定済みの47都道府県名をそのまま手がかりに
+    リンクを探すため、都道府県ごとのURLパターン(スラッグ)を推測する必要がない。
+    """
+    page.goto(search_url, wait_until="networkidle")
+
+    found: list[tuple[str, str]] = []
+    for name in PREFECTURES:
+        loc = None
+        for getter in (
+            lambda: page.get_by_role("link", name=name, exact=True),
+            lambda: page.get_by_role("link", name=name),
+            lambda: page.get_by_text(name, exact=True),
+        ):
+            candidate = getter().first
+            if candidate.count() > 0:
+                loc = candidate
+                break
+
+        if loc is None:
+            print(f"[warn] 「{name}」へのリンクが見つかりませんでした。スキップします。", file=sys.stderr)
+            continue
+
+        href = loc.get_attribute("href")
+        if not href:
+            print(f"[warn] 「{name}」のリンクに href がありませんでした。スキップします。", file=sys.stderr)
+            continue
+
+        found.append((name, urljoin(search_url, href)))
+
+    return found
+
+
+def merge_csvs(output_dir: str, merged_path: str) -> int:
+    """output_dir 内の都道府県ごとのCSVをすべて連結し、1つのCSVにまとめる。
+
+    処理済みの都道府県が増えるたびに呼び出すことで、実行の途中経過や
+    中断からの再開時点でも常に最新の全国合計CSVを参照できるようにする。
+    """
+    all_rows: list[list[str]] = []
+    for path in sorted(glob.glob(os.path.join(output_dir, "*.csv"))):
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # ヘッダ行を読み飛ばす
+            all_rows.extend(reader)
+
+    with open(merged_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["会社名", "住所", "電話番号", "FAX番号", "取得元URL"])
+        writer.writerows(all_rows)
+
+    return len(all_rows)
+
+
+def run_all_prefectures(page: Page, args: argparse.Namespace) -> None:
+    """start_url を都道府県トップページとして扱い、全都道府県を順番に取得する。
+
+    都道府県ごとに output_dir/<都道府県名>.csv として個別保存するため、
+    - 実行を中断しても、既に終わった都道府県の結果は失われない
+    - --force を付けなければ、既にファイルがある都道府県は再取得せず飛ばす
+      (中断後の再実行がそのまま「続きから」になる)
+    - 1都道府県の取得中にエラーが起きても、その都道府県だけスキップして
+      残りの都道府県は継続する
+    という形で長時間の全国走行に対応する。
+    """
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    prefectures = discover_prefecture_links(page, args.start_url)
+    print(f"[info] {len(prefectures)}/{len(PREFECTURES)} 都道府県のリンクを検出しました", file=sys.stderr)
+    if len(prefectures) < len(PREFECTURES):
+        missing = [name for name in PREFECTURES if name not in {n for n, _ in prefectures}]
+        print(f"[warn] リンクが見つからなかった都道府県: {', '.join(missing)}", file=sys.stderr)
+
+    for i, (name, url) in enumerate(prefectures, 1):
+        pref_csv = os.path.join(args.output_dir, f"{name}.csv")
+        if os.path.exists(pref_csv) and not args.force:
+            print(
+                f"[info] ({i}/{len(prefectures)}) {name}: 既存ファイルがあるためスキップします ({pref_csv})",
+                file=sys.stderr,
+            )
+            continue
+
+        print(f"[info] ({i}/{len(prefectures)}) {name} の取得を開始します: {url}", file=sys.stderr)
+        try:
+            records = scrape_list_pages(page, url, args)
+            save_csv(records, pref_csv)
+            print(f"[info] {name}: {len(records)} 件を {pref_csv} に保存しました", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - 1都道府県の失敗で全体を止めないための意図的な広い捕捉
+            print(f"[error] {name} の取得中にエラーが発生しました: {exc}", file=sys.stderr)
+            print(f"[error] {name} をスキップして次の都道府県に進みます", file=sys.stderr)
+
+        total = merge_csvs(args.output_dir, args.output)
+        print(f"[info] ここまでの全国合計を {args.output} に反映しました(現在 {total} 件)", file=sys.stderr)
+
+        if i < len(prefectures):
+            time.sleep(args.delay_between_prefectures)
+
+    print("[done] 全都道府県の処理が完了しました", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("start_url", help="加盟店一覧ページのURL(都道府県等で絞り込み済みのもの)")
+    parser.add_argument(
+        "start_url",
+        help="加盟店一覧ページのURL(都道府県等で絞り込み済みのもの)。"
+        "--all-prefectures 指定時は都道府県トップページ(例: https://www.lixil-reform.net/shop_search)",
+    )
     parser.add_argument("-o", "--output", default="lixil_shops.csv", help="出力CSVファイルパス")
     parser.add_argument("--contact-button-text", default="問い合わせする", help="電話/FAXを表示させるボタンの文言")
     parser.add_argument(
@@ -560,67 +733,47 @@ def main() -> None:
         action="store_true",
         help="1ページ目の最初の1件だけ処理して抽出結果を表示し終了する(調整用)",
     )
+    parser.add_argument(
+        "--all-prefectures",
+        action="store_true",
+        help="start_url を都道府県トップページ(例: https://www.lixil-reform.net/shop_search)として扱い、"
+        "47都道府県すべてを順番に取得する",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="lixil_shops_by_pref",
+        help="(--all-prefectures時) 都道府県ごとのCSVを保存するディレクトリ",
+    )
+    parser.add_argument(
+        "--delay-between-prefectures",
+        type=float,
+        default=5.0,
+        help="(--all-prefectures時) 都道府県間の待機時間(秒)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="(--all-prefectures時) 既に output-dir にCSVがある都道府県も再取得する(既定はスキップして再開)",
+    )
     args = parser.parse_args()
-
-    all_records: list[ShopRecord] = []
 
     with sync_playwright() as p:
         browser = launch_browser(p, headless=not args.headed)
         page = browser.new_page()
-        page.goto(args.start_url, wait_until="networkidle")
 
-        page_count = 0
-        total_pages: int | None = None
-        while True:
-            page_count += 1
-            print(f"[info] ページ {page_count} を処理中: {page.url}", file=sys.stderr)
-            remaining = args.max_items - len(all_records) if args.max_items else 0
-            records = scrape_page(
-                page,
-                args.contact_button_text,
-                args.close_selector,
-                args.delay_between_cards,
-                args.popup_wait_ms,
-                args.debug_first_card,
-                max_items=remaining,
-            )
-            all_records.extend(records)
-            print(f"[info] このページで {len(records)} 件取得(累計 {len(all_records)} 件)", file=sys.stderr)
+        if args.all_prefectures:
+            run_all_prefectures(page, args)
+            browser.close()
+            return
 
-            if args.max_items and len(all_records) >= args.max_items:
-                print(f"[info] --max-items の上限({args.max_items})に到達したため終了します", file=sys.stderr)
-                break
-
-            if page_count == 1 and records:
-                total_items = extract_total_items(page)
-                page_size = len(records)
-                if total_items:
-                    total_pages = math.ceil(total_items / page_size)
-                    print(
-                        f"[info] 総件数 {total_items} 件 / 1ページ {page_size} 件 "
-                        f"→ 全 {total_pages} ページと推定",
-                        file=sys.stderr,
-                    )
-
-            if args.debug_first_card:
-                break
-            if args.max_pages and page_count >= args.max_pages:
-                print(f"[info] --max-pages の上限({args.max_pages})に到達したため終了します", file=sys.stderr)
-                break
-            if total_pages and page_count >= total_pages:
-                print("[info] 推定ページ数に到達したため終了します", file=sys.stderr)
-                break
-            if not go_to_page(page, page_count + 1, args.next_page_text, args.delay_between_pages):
-                print("[info] 次ページへのリンクが見つからなかったため終了します", file=sys.stderr)
-                break
-
+        records = scrape_list_pages(page, args.start_url, args)
         browser.close()
 
     if args.debug_first_card:
         return
 
-    save_csv(all_records, args.output)
-    print(f"[done] {len(all_records)} 件を {args.output} に保存しました", file=sys.stderr)
+    save_csv(records, args.output)
+    print(f"[done] {len(records)} 件を {args.output} に保存しました", file=sys.stderr)
 
 
 if __name__ == "__main__":
