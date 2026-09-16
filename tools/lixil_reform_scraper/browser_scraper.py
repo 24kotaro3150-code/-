@@ -78,6 +78,24 @@ def launch_browser(p, headless: bool):
     return p.chromium.launch(**kwargs)
 
 
+_FIND_CARD_BY_ITEM_CLASS_JS = """
+el => {
+    // 実サイトのDOM確認で判明した、1店舗=1個の<li class="p-caseListItems__item">
+    // という構造を最優先の手がかりにする。クラス名が変わった場合に備えて、
+    // BEM命名の "__item" で終わるクラスも同様に「1件分のアイテム」とみなす。
+    let cur = el;
+    for (let i = 0; i < 20 && cur.parentElement; i++) {
+        cur = cur.parentElement;
+        if (!cur.classList) continue;
+        if (cur.classList.contains('p-caseListItems__item')) return cur;
+        for (const cls of cur.classList) {
+            if (cls.endsWith('__item')) return cur;
+        }
+    }
+    return null;
+}
+"""
+
 _FIND_CARD_BOUNDARY_JS = """
 (el, contactText) => {
     // ボタンが <button>/<a>/role=button とは限らない(例: 単なる<div class="m-btn">)
@@ -117,13 +135,21 @@ _FIND_CARD_BOUNDARY_JS = """
 def find_card(button: Locator, contact_button_text: str) -> ElementHandle | None:
     """「問い合わせする」ボタンから店舗カードの境界要素を特定する。
 
-    タグ名やclass名、見出しの有無に依存せず、対象ボタンを起点に祖先を
-    辿って「他の店舗のボタンを巻き込む直前の、最も外側の祖先要素」を
-    カード(1店舗分のブロック)とみなす、汎用的な一覧アイテム境界検出。
+    1. まず、実サイトで確認済みの "__item" 系クラス(p-caseListItems__item等)
+       を持つ祖先を優先的に探す。PC/SP切り替えなどで「問い合わせする」ボタンが
+       カード内に複数存在するケースでも正しくカード全体を取れる。
+    2. 見つからない場合のみ、タグ名やclass名に依存しない汎用ヒューリスティック
+       (「他の店舗のボタンを巻き込む直前の、最も外側の祖先」)にフォールバックする。
     """
     handle = button.element_handle()
     if handle is None:
         return None
+
+    by_class = handle.evaluate_handle(_FIND_CARD_BY_ITEM_CLASS_JS)
+    card = by_class.as_element()
+    if card is not None:
+        return card
+
     result = handle.evaluate_handle(_FIND_CARD_BOUNDARY_JS, contact_button_text)
     return result.as_element()
 
@@ -246,8 +272,13 @@ def scrape_page(
     records: list[ShopRecord] = []
     buttons = page.get_by_role("button", name=contact_button_text).all()
     if not buttons:
-        # role=button で取れない場合(<a>タグ実装など)への保険
+        # role=button で取れない場合(<a>タグ・role無しdiv実装など)への保険
         buttons = page.locator(f"text={contact_button_text}").all()
+
+    # PC/SP切り替えUIでは同じ文言のボタンがDOM上に複数(非表示分も)存在することが
+    # あるため、実際に見えているものだけを対象にする。非表示要素をクリックしようと
+    # するとPlaywrightが操作可能になるまで待ち続け、スクリプトがハングするため。
+    buttons = [b for b in buttons if b.is_visible()]
 
     for i, button in enumerate(buttons):
         card = find_card(button, contact_button_text)
