@@ -234,32 +234,105 @@ def debug_dump_dom(button: Locator, card: ElementHandle | None) -> None:
     )
 
 
+# 実サイトのDOM確認で判明した、ポップアップ本体のクラス名パターン。
+# トリガー側は "tooltip-contact-trigger"、ポップアップ本体は "tooltip-contact ..." で
+# "trigger" を含まないため、両者をこの条件で区別できる。
+_OPEN_TOOLTIP_TEXT_JS = """
+() => {
+    const candidates = Array.from(document.querySelectorAll('[class*="tooltip-contact"]'))
+        .filter(el => !el.className.includes('trigger'));
+    for (const el of candidates) {
+        const style = window.getComputedStyle(el);
+        if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null) {
+            return el.innerText;
+        }
+    }
+    return null;
+}
+"""
+
+_ANY_TOOLTIP_OPEN_JS = """
+() => {
+    const candidates = Array.from(document.querySelectorAll('[class*="tooltip-contact"]'))
+        .filter(el => !el.className.includes('trigger'));
+    return candidates.some(el => {
+        const style = window.getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+    });
+}
+"""
+
+
 def open_popup_and_read(page: Page, button: Locator, popup_wait_ms: int) -> tuple[str, str]:
     """「問い合わせする」ボタンをクリックし、開いたポップアップからTEL/FAXを読む。"""
     button.click()
     try:
         page.wait_for_timeout(popup_wait_ms)
-        # ポップアップの本文全体からTEL/FAXっぽい番号を正規表現で拾う。
-        # ラベルの正確な文言・マークアップに依存しないための方式。
-        body_text = page.locator("body").inner_text()
+        # まず、実際に開いている(表示中の)ポップアップ本体の中だけを見る。
+        # 前のカードのポップアップが閉じ切れずに残っていた場合の誤読を防ぐため、
+        # ページ全体のテキストは最後の保険としてのみ使う。
+        scoped_text = page.evaluate(_OPEN_TOOLTIP_TEXT_JS)
     except PlaywrightTimeoutError:
         return "", ""
 
-    phones = PHONE_RE.findall(body_text)
+    source_text = scoped_text
+    if not source_text:
+        source_text = page.locator("body").inner_text()
+
+    phones = PHONE_RE.findall(source_text)
     phone = phones[0] if len(phones) >= 1 else ""
     fax = phones[1] if len(phones) >= 2 else ""
     return phone, fax
 
 
+def _tooltip_is_open(page: Page) -> bool:
+    try:
+        return bool(page.evaluate(_ANY_TOOLTIP_OPEN_JS))
+    except PlaywrightTimeoutError:
+        return False
+
+
 def close_popup(page: Page, close_selector: str) -> None:
-    close_btn = page.locator(close_selector).first
-    if close_btn.count() > 0:
+    """ポップアップを閉じ、実際に閉じたことまで確認する。
+
+    実サイトの閉じるボタンは <div class="close_btn"><img alt="×ボタン"></div> という
+    構造で、"×" という文字そのものは持たない(imgのalt属性のみ)。そのため単純な
+    text=× セレクタでは一致しないことがあり、閉じ損ねると次のカードのクリックが
+    「開いたまま」扱いで無視され、前の値を読み続けてしまう。これを避けるため、
+    実際に確認済みの .close_btn を優先しつつ複数の候補を試し、最後に
+    「ポップアップが本当に非表示になったか」をJS側で検証する。
+    """
+    candidates = [close_selector, ".close_btn", 'img[alt*="×"]', 'img[alt*="閉じる"]', "text=×"]
+    seen: set[str] = set()
+    for sel in candidates:
+        if not sel or sel in seen:
+            continue
+        seen.add(sel)
         try:
-            close_btn.click(timeout=2000)
-            return
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=2000)
         except PlaywrightTimeoutError:
-            pass
+            continue
+
+        page.wait_for_timeout(200)
+        if not _tooltip_is_open(page):
+            return
+
+    # ここまでで閉じたと確認できなかった場合の最終手段。
     page.keyboard.press("Escape")
+    try:
+        page.mouse.click(2, 2)
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(200)
+
+    if _tooltip_is_open(page):
+        print(
+            "[warn] ポップアップが閉じたことを確認できませんでした。"
+            "次の店舗の電話番号/FAXが誤って前の値のままになっている可能性があります。",
+            file=sys.stderr,
+        )
 
 
 def scrape_page(
@@ -420,7 +493,12 @@ def main() -> None:
     parser.add_argument("start_url", help="加盟店一覧ページのURL(都道府県等で絞り込み済みのもの)")
     parser.add_argument("-o", "--output", default="lixil_shops.csv", help="出力CSVファイルパス")
     parser.add_argument("--contact-button-text", default="問い合わせする", help="電話/FAXを表示させるボタンの文言")
-    parser.add_argument("--close-selector", default="text=×", help="ポップアップを閉じるボタンのCSS/テキストセレクタ")
+    parser.add_argument(
+        "--close-selector",
+        default="",
+        help="ポップアップを閉じるボタンのCSS/テキストセレクタ(最優先で試す)。"
+        "省略時は実サイトで確認済みの .close_btn 等を自動で試す",
+    )
     parser.add_argument(
         "--next-page-text",
         default="次へ",
