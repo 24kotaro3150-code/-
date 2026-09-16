@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import sys
 import time
@@ -312,17 +313,93 @@ def scrape_page(
     return records
 
 
-def go_to_next_page(page: Page, next_page_text: str, delay: float) -> bool:
-    next_link = page.get_by_role("link", name=next_page_text).first
-    if next_link.count() == 0:
-        next_link = page.locator(f"text={next_page_text}").first
-    if next_link.count() == 0:
-        return False
+TOTAL_COUNT_RE = re.compile(r"(\d+)\s*件中")
+
+# ページ番号のリンクが見つからない場合(番号ウィンドウの外にいる等)に備えた、
+# 「次へ」を意味しそうな矢印/ボタンの候補セレクタ。上から順に試す。
+_NEXT_ARROW_SELECTOR_CANDIDATES = [
+    'a[aria-label="次へ"]',
+    'button[aria-label="次へ"]',
+    'a[aria-label="Next"]',
+    'button[aria-label="Next"]',
+    'a[rel="next"]',
+    'button[rel="next"]',
+    '[class*="pagination"] [class*="next"]',
+    '[class*="pager"] [class*="next"]',
+    "text=›",
+    "text=»",
+    "text=＞",
+    "text=>",
+]
+
+
+def extract_total_items(page: Page) -> int | None:
+    """「368件中 1〜10件を表示」のような表記から総件数を読み取る。"""
     try:
-        next_link.click(timeout=3000)
+        text = page.locator("body").inner_text()
     except PlaywrightTimeoutError:
+        return None
+    m = TOTAL_COUNT_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
+def go_to_page(page: Page, target_page: int, next_page_text: str, delay: float) -> bool:
+    """指定したページ番号に進む。
+
+    1. まずページ番号そのもの(例: "2")をクリックする。誤クリックを避けるため
+       role=link/button で名前が完全一致するものを優先し、それでも見つからない
+       場合のみテキスト完全一致で探す。
+    2. ページ番号がウィンドウ外で見当たらない場合は、「次へ」相当の矢印/ボタンを
+       候補セレクタから順に試してクリックする。
+    """
+    before_text = ""
+    try:
+        before_text = page.locator("body").inner_text()[:2000]
+    except PlaywrightTimeoutError:
+        pass
+
+    clicked = False
+    target_str = str(target_page)
+    for getter in (
+        lambda: page.get_by_role("link", name=target_str, exact=True),
+        lambda: page.get_by_role("button", name=target_str, exact=True),
+        lambda: page.get_by_text(target_str, exact=True),
+    ):
+        try:
+            loc = getter().first
+            if loc.count() > 0 and loc.is_visible():
+                loc.click(timeout=3000)
+                clicked = True
+                break
+        except PlaywrightTimeoutError:
+            continue
+
+    if not clicked:
+        for sel in [f"text={next_page_text}", *_NEXT_ARROW_SELECTOR_CANDIDATES]:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible():
+                    loc.click(timeout=3000)
+                    clicked = True
+                    break
+            except PlaywrightTimeoutError:
+                continue
+
+    if not clicked:
         return False
+
     page.wait_for_load_state("networkidle")
+    if before_text:
+        try:
+            page.wait_for_function(
+                "(prev) => document.body.innerText.slice(0, 2000) !== prev",
+                arg=before_text,
+                timeout=8000,
+            )
+        except PlaywrightTimeoutError:
+            # SPA遷移でない、または比較範囲がたまたま変化しない場合もあるので、
+            # ここでは失敗として扱わず、下の待機時間に委ねる。
+            pass
     time.sleep(delay)
     return True
 
@@ -341,7 +418,11 @@ def main() -> None:
     parser.add_argument("-o", "--output", default="lixil_shops.csv", help="出力CSVファイルパス")
     parser.add_argument("--contact-button-text", default="問い合わせする", help="電話/FAXを表示させるボタンの文言")
     parser.add_argument("--close-selector", default="text=×", help="ポップアップを閉じるボタンのCSS/テキストセレクタ")
-    parser.add_argument("--next-page-text", default="次へ", help="次ページへのリンク/ボタンの文言")
+    parser.add_argument(
+        "--next-page-text",
+        default="次へ",
+        help="ページ番号リンクが見つからない場合に使う「次へ」相当リンク/ボタンの文言",
+    )
     parser.add_argument("--max-pages", type=int, default=0, help="巡回する一覧ページ数の上限。0で無制限")
     parser.add_argument("--delay-between-cards", type=float, default=0.8, help="カードごとの待機時間(秒)")
     parser.add_argument("--delay-between-pages", type=float, default=1.5, help="ページ送り後の待機時間(秒)")
@@ -362,6 +443,7 @@ def main() -> None:
         page.goto(args.start_url, wait_until="networkidle")
 
         page_count = 0
+        total_pages: int | None = None
         while True:
             page_count += 1
             print(f"[info] ページ {page_count} を処理中: {page.url}", file=sys.stderr)
@@ -374,12 +456,29 @@ def main() -> None:
                 args.debug_first_card,
             )
             all_records.extend(records)
+            print(f"[info] このページで {len(records)} 件取得(累計 {len(all_records)} 件)", file=sys.stderr)
+
+            if page_count == 1 and records:
+                total_items = extract_total_items(page)
+                page_size = len(records)
+                if total_items:
+                    total_pages = math.ceil(total_items / page_size)
+                    print(
+                        f"[info] 総件数 {total_items} 件 / 1ページ {page_size} 件 "
+                        f"→ 全 {total_pages} ページと推定",
+                        file=sys.stderr,
+                    )
 
             if args.debug_first_card:
                 break
             if args.max_pages and page_count >= args.max_pages:
+                print(f"[info] --max-pages の上限({args.max_pages})に到達したため終了します", file=sys.stderr)
                 break
-            if not go_to_next_page(page, args.next_page_text, args.delay_between_pages):
+            if total_pages and page_count >= total_pages:
+                print("[info] 推定ページ数に到達したため終了します", file=sys.stderr)
+                break
+            if not go_to_page(page, page_count + 1, args.next_page_text, args.delay_between_pages):
+                print("[info] 次ページへのリンクが見つからなかったため終了します", file=sys.stderr)
                 break
 
         browser.close()
