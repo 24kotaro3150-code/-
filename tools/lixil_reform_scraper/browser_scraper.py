@@ -670,6 +670,10 @@ def run_all_prefectures(page: Page, args: argparse.Namespace) -> None:
         missing = [name for name in PREFECTURES if name not in {n for n, _ in prefectures}]
         print(f"[warn] リンクが見つからなかった都道府県: {', '.join(missing)}", file=sys.stderr)
 
+    if args.max_prefectures:
+        prefectures = prefectures[: args.max_prefectures]
+        print(f"[info] --max-prefectures により先頭 {len(prefectures)} 都道府県のみ処理します", file=sys.stderr)
+
     for i, (name, url) in enumerate(prefectures, 1):
         pref_csv = os.path.join(args.output_dir, f"{name}.csv")
         if os.path.exists(pref_csv) and not args.force:
@@ -749,6 +753,12 @@ def main() -> None:
         type=float,
         default=5.0,
         help="(--all-prefectures時) 都道府県間の待機時間(秒)",
+    )
+    parser.add_argument(
+        "--max-prefectures",
+        type=int,
+        default=0,
+        help="(--all-prefectures時) 処理する都道府県数の上限(先頭から)。0で無制限。動作確認用",
     )
     parser.add_argument(
         "--force",
