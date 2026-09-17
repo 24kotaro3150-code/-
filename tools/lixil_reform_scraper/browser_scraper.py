@@ -700,6 +700,25 @@ def run_all_prefectures(browser, args: argparse.Namespace) -> None:
         missing = [name for name in PREFECTURES if name not in {n for n, _ in prefectures}]
         print(f"[warn] リンクが見つからなかった都道府県: {', '.join(missing)}", file=sys.stderr)
 
+    if args.prefectures:
+        wanted = [p.strip() for p in args.prefectures.split(",") if p.strip()]
+        unknown = [p for p in wanted if p not in PREFECTURES]
+        if unknown:
+            print(
+                f"[warn] --prefectures に含まれる次の名前は標準の都道府県名と一致しません: {', '.join(unknown)}",
+                file=sys.stderr,
+            )
+        wanted_set = set(wanted)
+        prefectures = [(name, url) for name, url in prefectures if name in wanted_set]
+        not_found = wanted_set - {name for name, _ in prefectures}
+        if not_found:
+            print(
+                f"[warn] --prefectures で指定されたが、一覧ページ上でリンクが見つからなかった都道府県: "
+                f"{', '.join(sorted(not_found, key=PREFECTURES.index))}",
+                file=sys.stderr,
+            )
+        print(f"[info] --prefectures により {len(prefectures)} 都道府県のみ処理します", file=sys.stderr)
+
     if args.max_prefectures:
         prefectures = prefectures[: args.max_prefectures]
         print(f"[info] --max-prefectures により先頭 {len(prefectures)} 都道府県のみ処理します", file=sys.stderr)
@@ -792,6 +811,12 @@ def main() -> None:
         type=int,
         default=0,
         help="(--all-prefectures時) 処理する都道府県数の上限(先頭から)。0で無制限。動作確認用",
+    )
+    parser.add_argument(
+        "--prefectures",
+        default="",
+        help="(--all-prefectures時) カンマ区切りで指定した都道府県だけを処理する"
+        "(例: '佐賀県,長崎県,宮崎県,熊本県,鹿児島県,沖縄県')。省略時は全都道府県が対象",
     )
     parser.add_argument(
         "--force",
