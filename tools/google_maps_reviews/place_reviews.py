@@ -159,6 +159,27 @@ def latest_review_within(reviews: list[dict], cutoff: datetime) -> datetime | No
     return latest
 
 
+def process_place(
+    session: requests.Session, api_key: str, place_id: str, cutoff: datetime
+) -> tuple[ShopRecord | None, str | None]:
+    """1店舗のPlace Detailsを取得し、期間内口コミがあれば投稿日を付与して返す。
+
+    戻り値は (record, error)。取得自体に失敗した場合は (None, エラー文言)、
+    成功した場合は (record, None) で、record.latest_review_at が空なら
+    「対象外(期間内の口コミなし)」を意味する。
+    """
+    try:
+        data = get_place_details(session, api_key, place_id)
+    except RuntimeError as exc:
+        return None, str(exc)
+
+    record = details_to_record(place_id, data)
+    latest = latest_review_within(data.get("reviews", []), cutoff)
+    if latest is not None:
+        record.latest_review_at = latest.strftime("%Y-%m-%d")
+    return record, None
+
+
 def details_to_record(place_id: str, data: dict) -> ShopRecord:
     display_name = data.get("displayName", {})
     company = display_name.get("text", "") if isinstance(display_name, dict) else ""
@@ -192,20 +213,53 @@ def save_csv(records: list[ShopRecord], output_path: str) -> None:
             )
 
 
+def load_query_file(path: str) -> list[str]:
+    queries = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            queries.append(line)
+    return queries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--query",
         action="append",
-        required=True,
+        default=[],
         help="検索クエリ(例: '世田谷区 リフォーム')。複数回指定すると結果を合算する",
     )
+    parser.add_argument(
+        "--query-file",
+        help="検索クエリを1行1件で書いたテキストファイル(#で始まる行と空行は無視)。"
+        "市町村数が多い県全体をまとめて検索したい場合などに使う。--queryと併用可能",
+    )
     parser.add_argument("--api-key", default=os.environ.get("GOOGLE_MAPS_API_KEY", ""), help="Places APIキー")
-    parser.add_argument("--max-results", type=int, default=100, help="クエリ全体で取得する最大件数")
+    parser.add_argument(
+        "--target-count",
+        type=int,
+        default=100,
+        help="この件数だけ「期間内に口コミがある店舗」が見つかったら、そこで打ち切る(0で無制限)",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=500,
+        help="target-countに到達しなかった場合の安全上限。この件数の候補を調べたら打ち切る",
+    )
     parser.add_argument("--months", type=int, default=12, help="この月数以内に口コミがある店舗だけを残す")
     parser.add_argument("--output", "-o", default="place_reviews.csv", help="出力CSVファイルパス")
     parser.add_argument("--delay", type=float, default=0.2, help="Place Details呼び出し間の待機時間(秒)")
     args = parser.parse_args()
+
+    if args.query_file:
+        args.query = list(args.query) + load_query_file(args.query_file)
+    if not args.query:
+        print("[error] --query または --query-file で検索クエリを指定してください。", file=sys.stderr)
+        sys.exit(1)
 
     if not args.api_key:
         print(
@@ -215,51 +269,54 @@ def main() -> None:
         sys.exit(1)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(365 * args.months / 12))
+    target_count = args.target_count or float("inf")
+    max_results = args.max_results or float("inf")
 
     session = requests.Session()
 
     seen_place_ids: set[str] = set()
-    place_ids: list[str] = []
-    for query in args.query:
-        remaining = args.max_results - len(place_ids)
-        if remaining <= 0:
-            break
-        print(f"[info] 検索中: {query!r}", file=sys.stderr)
-        for pid in iter_search_results(session, args.api_key, query, remaining):
-            if pid in seen_place_ids:
-                continue
-            seen_place_ids.add(pid)
-            place_ids.append(pid)
-            if len(place_ids) >= args.max_results:
-                break
-        print(f"[info] 現在の候補件数: {len(place_ids)}", file=sys.stderr)
-
-    print(f"[info] 候補 {len(place_ids)} 件について詳細・口コミを取得します", file=sys.stderr)
-
     results: list[ShopRecord] = []
-    for i, place_id in enumerate(place_ids, 1):
-        try:
-            data = get_place_details(session, args.api_key, place_id)
-        except RuntimeError as exc:
-            print(f"[warn] ({i}/{len(place_ids)}) {place_id}: 取得失敗 ({exc})", file=sys.stderr)
+    examined = 0
+
+    for query in args.query:
+        if len(results) >= target_count or examined >= max_results:
+            break
+
+        print(f"[info] 検索中: {query!r}", file=sys.stderr)
+        remaining_budget = max_results - examined if max_results != float("inf") else 10**9
+        for place_id in iter_search_results(session, args.api_key, query, remaining_budget):
+            if place_id in seen_place_ids:
+                continue
+            seen_place_ids.add(place_id)
+            examined += 1
+
+            record, err = process_place(session, args.api_key, place_id, cutoff)
             time.sleep(args.delay)
-            continue
 
-        record = details_to_record(place_id, data)
-        reviews = data.get("reviews", [])
-        latest = latest_review_within(reviews, cutoff)
+            if err:
+                print(f"[warn] ({examined}) {place_id}: 取得失敗 ({err})", file=sys.stderr)
+            elif record.latest_review_at:
+                results.append(record)
+                print(
+                    f"[info] ({examined}) {record.company}: 対象(最新口コミ {record.latest_review_at}) "
+                    f"現在 {len(results)}/{args.target_count or '無制限'} 件",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[info] ({examined}) {record.company}: 対象外(期間内の口コミなし)", file=sys.stderr)
 
-        if latest is not None:
-            record.latest_review_at = latest.strftime("%Y-%m-%d")
-            results.append(record)
-            print(f"[info] ({i}/{len(place_ids)}) {record.company}: 対象(最新口コミ {record.latest_review_at})", file=sys.stderr)
-        else:
-            print(f"[info] ({i}/{len(place_ids)}) {record.company}: 対象外(期間内の口コミなし)", file=sys.stderr)
+            if len(results) >= target_count or examined >= max_results:
+                break
 
-        time.sleep(args.delay)
+    if len(results) >= target_count:
+        print(f"[info] --target-count の {args.target_count} 件に到達したため終了します", file=sys.stderr)
+    elif examined >= max_results:
+        print(f"[info] --max-results の安全上限 {args.max_results} 件に到達したため終了します", file=sys.stderr)
+    else:
+        print("[info] 指定したクエリをすべて調べ終えました", file=sys.stderr)
 
     save_csv(results, args.output)
-    print(f"[done] 条件に合致した {len(results)}/{len(place_ids)} 件を {args.output} に保存しました", file=sys.stderr)
+    print(f"[done] 条件に合致した {len(results)} 件(候補 {examined} 件を調査)を {args.output} に保存しました", file=sys.stderr)
 
 
 if __name__ == "__main__":
