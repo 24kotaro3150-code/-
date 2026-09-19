@@ -128,7 +128,10 @@ def get_place_details(session: requests.Session, api_key: str, place_id: str) ->
         "X-Goog-FieldMask": DETAILS_FIELD_MASK,
     }
     url = DETAILS_URL.format(place_id=place_id)
-    resp = session.get(url, headers=headers, timeout=20)
+    # languageCode を指定しないと店舗によって英語表記(ローマ字)の住所が
+    # 返ってくることがあるため、明示的に日本語を指定する。
+    params = {"languageCode": "ja", "regionCode": "JP"}
+    resp = session.get(url, headers=headers, params=params, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"Place Details 失敗 ({resp.status_code}): {resp.text[:500]}")
     return resp.json()
