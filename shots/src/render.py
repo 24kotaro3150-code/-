@@ -1,4 +1,4 @@
-import json, subprocess, sys, os
+import json, subprocess, sys, os, re
 from PIL import Image, ImageDraw, ImageFont
 
 SRC = "/root/.claude/uploads/d74b9b63-dcea-554d-9e65-dea67768f92e/9bb089b2-MEO__AI________________.mp4"
@@ -8,7 +8,7 @@ W, H = 1080, 1920
 NAVY, NAVY2, YEL = (24, 36, 104), (14, 22, 70), (255, 204, 0)
 VY, VH = 520, 608          # video slot
 CAP_Y = 1218               # caption center
-OUT = sys.argv[1] if len(sys.argv) > 1 else "out"
+OUT = sys.argv[1] if len(sys.argv) > 1 else "shots"
 os.makedirs(OUT, exist_ok=True)
 
 def fit(draw, text, path, size, maxw):
@@ -114,7 +114,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     open(path, "w").write(head + "\n".join(ev) + "\n")
 
 def render(c):
-    base = f"{OUT}/short{c['id']}"
+    title = re.sub(r'[\\/:*?"<>|]', "", f"{c['id']}_{c['t1']}{c['t2']}".replace(" ", ""))
+    base = f"{OUT}/{title}"
     ov, sub = f"{OUT}/.ov{c['id']}.png", f"{OUT}/.sub{c['id']}.ass"
     overlay(c, ov); ass(c, sub)
     fc, n = [], len(c["segs"])
