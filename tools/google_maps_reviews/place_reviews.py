@@ -196,6 +196,9 @@ def details_to_record(place_id: str, data: dict) -> ShopRecord:
 
 
 def save_csv(records: list[ShopRecord], output_path: str) -> None:
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["会社名", "電話番号", "住所", "口コミ件数", "平均評価", "直近1年以内の最新口コミ日", "Google マップURL"])
@@ -251,7 +254,15 @@ def main() -> None:
         help="target-countに到達しなかった場合の安全上限。この件数の候補を調べたら打ち切る",
     )
     parser.add_argument("--months", type=int, default=12, help="この月数以内に口コミがある店舗だけを残す")
-    parser.add_argument("--output", "-o", default="place_reviews.csv", help="出力CSVファイルパス")
+    default_output = os.path.join(
+        os.path.expanduser("~"), "Desktop", f"place_reviews_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=default_output,
+        help="出力CSVファイルパス。省略時はデスクトップに実行日時入りのファイル名で保存する",
+    )
     parser.add_argument("--delay", type=float, default=0.2, help="Place Details呼び出し間の待機時間(秒)")
     args = parser.parse_args()
 
