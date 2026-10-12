@@ -264,6 +264,13 @@ def main() -> None:
         help="出力CSVファイルパス。省略時はデスクトップに実行日時入りのファイル名で保存する",
     )
     parser.add_argument("--delay", type=float, default=0.2, help="Place Details呼び出し間の待機時間(秒)")
+    parser.add_argument(
+        "--skip-queries",
+        type=int,
+        default=0,
+        help="クエリ一覧の先頭からこの件数を飛ばしてから検索を始める。"
+        "前回の実行で既に調べ終えた市町村を再度調べずに続きから再開したい場合に使う",
+    )
     args = parser.parse_args()
 
     if args.query_file:
@@ -271,6 +278,14 @@ def main() -> None:
     if not args.query:
         print("[error] --query または --query-file で検索クエリを指定してください。", file=sys.stderr)
         sys.exit(1)
+
+    if args.skip_queries:
+        skipped = args.query[: args.skip_queries]
+        args.query = args.query[args.skip_queries :]
+        print(
+            f"[info] --skip-queries により先頭 {len(skipped)} 件をスキップします: {', '.join(skipped)}",
+            file=sys.stderr,
+        )
 
     if not args.api_key:
         print(
